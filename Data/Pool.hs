@@ -256,7 +256,14 @@ withResource ::
   => Pool a -> (a -> m b) -> m b
 {-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO b #-}
 withResource pool act = control $ \runInIO -> mask $ \restore -> do
-  (resource, local) <- takeResource pool
+  (Entry{..}, local) <- takeEntry pool
+  now <- getCurrentTime
+  resource <- if (now `diffUTCTime` lastUse) < idleTime pool
+    then return entry
+    else do
+      destroy pool entry
+      create pool
+
   ret <- restore (runInIO (act resource)) `onException`
             destroyResource pool local resource
   putResource local resource
@@ -273,18 +280,25 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
 takeResource :: Pool a -> IO (a, LocalPool a)
-takeResource pool@Pool{..} = do
+takeResource pool = do
+  (Entry{..}, local) <- takeEntry pool
+  return (entry, local)
+
+takeEntry :: Pool a -> IO (Entry a, LocalPool a)
+takeEntry pool@Pool{..} = do
   local@LocalPool{..} <- getLocalPool pool
   resource <- liftBase . join . atomically $ do
     ents <- readTVar entries
     case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return entry)
+      (entry:es) -> writeTVar entries es >> return (return entry)
       [] -> do
         used <- readTVar inUse
         when (used == maxResources) retry
         writeTVar inUse $! used + 1
-        return $
-          create `onException` atomically (modifyTVar_ inUse (subtract 1))
+        return $ do
+          now <- getCurrentTime
+          entry <- create `onException` atomically (modifyTVar_ inUse (subtract 1))
+          return Entry{lastUse=now, entry=entry}
   return (resource, local)
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE takeResource #-}
